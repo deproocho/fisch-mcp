@@ -440,7 +440,6 @@ _EXCLUDED_HTML_CLASSES = {
     "mw-editsection",
     "item-icon",
     "ambox",
-    "mbox",
     "toc",
     "catlinks",
     "mw-empty-elt",
@@ -448,6 +447,8 @@ _EXCLUDED_HTML_CLASSES = {
     "reference",
     "plainlinks",
 }
+
+_EXCLUDED_MBOX_CLASSES = {"stub", "subjective", "outdated", "trivia", "delete"}
 
 
 class _DOMBuilder(html.parser.HTMLParser):
@@ -464,6 +465,8 @@ class _DOMBuilder(html.parser.HTMLParser):
             return True
         classes = set(attrs_dict.get("class", "").split())
         if classes & _EXCLUDED_HTML_CLASSES:
+            return True
+        if "mbox" in classes and (classes & _EXCLUDED_MBOX_CLASSES):
             return True
         if attrs_dict.get("id") in {"toc"}:
             return True
@@ -820,6 +823,52 @@ def _render_table(node: _Node, base_url: str = FISCHIPEDIA_BASE_URL) -> str:
     return "\n".join(out_lines)
 
 
+def _iter_list_items(container: _Node) -> list[_Node]:
+    """
+    Yield `<li>` elements from a list container (`<ul>`, `<ol>`, or `.rod-mastery-reward-note`),
+    unwrapping intermediate inline formatting tags (`<i>`, `<b>`, `<span>`) that MediaWiki
+    sometimes wraps around `<li>` elements.
+    """
+    items: list[_Node] = []
+    for child in container.children:
+        if not isinstance(child, _Node):
+            continue
+        if child.tag == "li":
+            items.append(child)
+        elif child.tag in {"i", "em", "b", "strong", "span"}:
+            items.extend(_iter_list_items(child))
+    return items
+
+
+def _split_li_children(li_node: _Node) -> tuple[list[_Node | str], list[_Node]]:
+    """
+    Split an `<li>` node's children into `(inline_parts, sublists)`, even when a nested
+    `<ul>`/`<ol>` is wrapped inside an `<i>` or `<b>` tag.
+    """
+    inline_parts: list[_Node | str] = []
+    sublists: list[_Node] = []
+    for sub in li_node.children:
+        if isinstance(sub, _Node):
+            if sub.tag in {"ul", "ol"}:
+                sublists.append(sub)
+            elif sub.tag in {"i", "em", "b", "strong", "span"} and any(
+                isinstance(gc, _Node) and gc.tag in {"ul", "ol"} for gc in sub.children
+            ):
+                rem_inline: list[_Node | str] = []
+                for gc in sub.children:
+                    if isinstance(gc, _Node) and gc.tag in {"ul", "ol"}:
+                        sublists.append(gc)
+                    else:
+                        rem_inline.append(gc)
+                if rem_inline:
+                    inline_parts.append(_Node(sub.tag, attrs=sub.attrs, children=rem_inline))
+            else:
+                inline_parts.append(sub)
+        else:
+            inline_parts.append(sub)
+    return inline_parts, sublists
+
+
 def _render_list(node: _Node, *, base_url: str = FISCHIPEDIA_BASE_URL, indent: int = 0) -> str:
     if "gallery" in node.classes:
         return _render_gallery(node, base_url)
@@ -829,19 +878,11 @@ def _render_list(node: _Node, *, base_url: str = FISCHIPEDIA_BASE_URL, indent: i
     idx = 1
     prefix_pad = "  " * indent
 
-    for child in node.children:
-        if not isinstance(child, _Node) or child.tag != "li":
-            continue
+    for child in _iter_list_items(node):
         bullet = f"{idx}." if ordered else "-"
         idx += 1
 
-        inline_parts: list[_Node | str] = []
-        sublists: list[_Node] = []
-        for sub in child.children:
-            if isinstance(sub, _Node) and sub.tag in {"ul", "ol"}:
-                sublists.append(sub)
-            else:
-                inline_parts.append(sub)
+        inline_parts, sublists = _split_li_children(child)
 
         temp_node = _Node("span", children=inline_parts)
         item_text = _clean_inline_ws(_render_inline(temp_node, base_url=base_url, br_sep=" — "))
@@ -851,6 +892,84 @@ def _render_list(node: _Node, *, base_url: str = FISCHIPEDIA_BASE_URL, indent: i
             sub_md = _render_list(sl, base_url=base_url, indent=indent + 1)
             if sub_md:
                 lines.append(sub_md)
+
+    return "\n".join(lines)
+
+
+def _render_dl(node: _Node, *, base_url: str = FISCHIPEDIA_BASE_URL, indent: int = 0) -> str:
+    """Render MediaWiki `<dl>/<dt>/<dd>` definition/dialogue trees with indentation."""
+    lines: list[str] = []
+    pad = "  " * indent
+    for child in node.children:
+        if not isinstance(child, _Node) or child.tag not in {"dt", "dd"}:
+            continue
+        inline_parts: list[_Node | str] = []
+        sub_dls: list[_Node] = []
+        for sub in child.children:
+            if isinstance(sub, _Node) and sub.tag == "dl":
+                sub_dls.append(sub)
+            else:
+                inline_parts.append(sub)
+        temp = _Node("span", children=inline_parts)
+        txt = _clean_inline_ws(_render_inline(temp, base_url=base_url, br_sep=" "))
+        if txt:
+            if child.tag == "dt" and not txt.startswith("**"):
+                lines.append(f"{pad}**{txt}**")
+            else:
+                lines.append(f"{pad}{txt}")
+        for sdl in sub_dls:
+            sub_md = _render_dl(sdl, base_url=base_url, indent=indent + 1)
+            if sub_md:
+                lines.append(sub_md)
+    return "\n".join(lines)
+
+
+def _render_rod_mastery_container(node: _Node, *, base_url: str = FISCHIPEDIA_BASE_URL) -> str:
+    """Render `<div class="rod-mastery-container">` directly from DOM without losing sub-notes."""
+    lines: list[str] = []
+    challenges = [
+        c for c in node.children if isinstance(c, _Node) and "rod-mastery-challenge" in c.classes
+    ]
+    for ch in challenges:
+        hdr_node = _find_first(ch, lambda n: "rod-mastery-header" in n.classes)
+        desc_node = _find_first(ch, lambda n: "rod-mastery-description" in n.classes)
+        rew_node = _find_first(ch, lambda n: "rod-mastery-reward" in n.classes)
+        note_node = _find_first(ch, lambda n: "rod-mastery-reward-note" in n.classes)
+
+        hdr = _clean_inline_ws(_render_inline(hdr_node, base_url=base_url, br_sep=" ")) if hdr_node else ""
+        hdr = re.sub(r"^\*+|\*+$", "", hdr).strip()
+        desc = _clean_inline_ws(_render_inline(desc_node, base_url=base_url, br_sep=" ")) if desc_node else ""
+        rew = _clean_inline_ws(_render_inline(rew_node, base_url=base_url, br_sep=" ")) if rew_node else ""
+        rew = re.sub(r"^Reward:\s*", "", rew, flags=re.IGNORECASE).strip()
+
+        if "rod-mastery-grand" in ch.classes or hdr.upper() == "GRAND REWARD":
+            if rew:
+                lines.append(f"- **Grand Reward**: {rew}")
+            continue
+
+        if hdr and desc and rew:
+            lines.append(f"- **{hdr}**: {desc} → **Reward**: {rew}")
+        elif hdr and rew:
+            lines.append(f"- **{hdr}** → **Reward**: {rew}")
+        elif hdr and desc:
+            lines.append(f"- **{hdr}**: {desc}")
+
+        if note_node:
+            # Note node may contain `<ul>` children or bare `<li>` inside `<i>`
+            note_uls = [c for c in note_node.children if isinstance(c, _Node) and c.tag in {"ul", "ol"}]
+            if note_uls and not _iter_list_items(note_node):
+                for ul in note_uls:
+                    ul_md = _render_list(ul, base_url=base_url, indent=1)
+                    if ul_md:
+                        lines.append(ul_md)
+            elif _iter_list_items(note_node):
+                note_md = _render_list(note_node, base_url=base_url, indent=1)
+                if note_md:
+                    lines.append(note_md)
+            else:
+                note_txt = _clean_inline_ws(_render_inline(note_node, base_url=base_url, br_sep=" "))
+                if note_txt:
+                    lines.append(f"  - {note_txt}")
 
     return "\n".join(lines)
 
@@ -877,11 +996,27 @@ def _render_blocks(node: _Node, *, base_url: str = FISCHIPEDIA_BASE_URL) -> str:
         tag = child.tag
         classes = child.classes
 
+        if "mbox" in classes:
+            _flush_inline()
+            hdr_node = _find_first(child, lambda n: "mbox__content__header" in n.classes)
+            if hdr_node:
+                hdr_txt = _clean_inline_ws(_render_inline(hdr_node, base_url=base_url, br_sep=" "))
+                if hdr_txt:
+                    blocks.append(f"> **Note**: {hdr_txt}")
+            continue
+
         if "infobox" in classes:
             _flush_inline()
             ib = _render_infobox(child, base_url)
             if ib:
                 blocks.append(ib)
+            continue
+
+        if "rod-mastery-container" in classes:
+            _flush_inline()
+            rm = _render_rod_mastery_container(child, base_url=base_url)
+            if rm:
+                blocks.append(rm)
             continue
 
         if "mw-heading" in classes or tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
@@ -897,7 +1032,20 @@ def _render_blocks(node: _Node, *, base_url: str = FISCHIPEDIA_BASE_URL) -> str:
                 blocks.append(f"{'#' * level} {h_text}")
             continue
 
-        if "bestiary-description" in classes and not (classes & {"ability", "enchanting"}):
+        if "bestiary-description" in classes and "quest" in classes:
+            _flush_inline()
+            t_node = _find_first(child, lambda n: "bestiary-description-title" in n.classes)
+            c_node = _find_first(child, lambda n: "bestiary-description-content" in n.classes)
+            q_title = _clean_inline_ws(_render_inline(t_node, base_url=base_url, br_sep=" ")) if t_node else ""
+            q_title = re.sub(r"^\*+|\*+$", "", q_title).strip()
+            q_body = _render_blocks(c_node, base_url=base_url) if c_node else ""
+            if q_title and q_body:
+                blocks.append(f"### {q_title}\n\n{q_body}")
+            elif q_body:
+                blocks.append(q_body)
+            continue
+
+        if "bestiary-description" in classes and not (classes & {"ability", "enchanting", "quest"}):
             _flush_inline()
             c_node = _find_first(child, lambda n: "bestiary-description-content" in n.classes)
             s_node = _find_first(child, lambda n: "bestiary-description-source" in n.classes)
@@ -934,6 +1082,13 @@ def _render_blocks(node: _Node, *, base_url: str = FISCHIPEDIA_BASE_URL) -> str:
             lst = _render_list(child, base_url=base_url)
             if lst:
                 blocks.append(lst)
+            continue
+
+        if tag == "dl":
+            _flush_inline()
+            dl_md = _render_dl(child, base_url=base_url)
+            if dl_md:
+                blocks.append(dl_md)
             continue
 
         if tag == "p":
@@ -1876,12 +2031,36 @@ def extract_fragment_content(cleaned_markdown: str, fragment: str) -> str:
 
 def _compact_mastery_section(body_lines: list[str]) -> list[str]:
     """
-    Compact a `## Mastery` section's vertical paragraphs (`*Quest*` + requirement + `Reward: ...`)
-    into single-line bullets (`- **Quest**: Requirement → **Reward**: ...`).
+    Compact a `## Mastery` section's level requirement and grand reward header
+    while preserving all quest bullets and nested enhancement sub-bullets.
     """
+    raw_body = "\n".join(body_lines).strip()
+    if not raw_body:
+        return body_lines
+
+    # Fast path for DOM-rendered `.rod-mastery-container` bullet lists
+    if "- **Grand Reward**:" in raw_body:
+        level_req: str | None = None
+        filtered_lines: list[str] = []
+        for ln in raw_body.splitlines():
+            m_lvl = re.match(r"^Starting Level Requirement:\s*\**([^\n*]+)\**$", ln.strip(), re.IGNORECASE)
+            if m_lvl:
+                level_req = m_lvl.group(1).strip()
+                continue
+            if level_req and ln.startswith("- **Grand Reward**:"):
+                grand_val = ln.split("- **Grand Reward**:", 1)[1].strip()
+                filtered_lines.append(f"- **Level Req**: {level_req} | **Grand Reward**: {grand_val}")
+                level_req = None
+                continue
+            if ln.strip():
+                filtered_lines.append(ln)
+        if level_req:
+            filtered_lines.insert(0, f"- **Level Req**: {level_req}")
+        return filtered_lines
+
     paragraphs = [
         p.strip()
-        for p in re.split(r"\n{2,}", "\n".join(body_lines).strip())
+        for p in re.split(r"\n{2,}", raw_body)
         if p.strip()
     ]
     if not paragraphs:
@@ -2091,7 +2270,7 @@ def _compact_article_body(text: str, *, strip_skin_patches: bool = True) -> str:
     #    - Desmos XP calculator boilerplate on level rods
     #    - Redundant "Obtaining the X rewards Y XP in the Rod Journal." when "- **Journal**:" is present
     text = re.sub(r"^\*Main article:[^\n]+\*\s*\n+", "", text, flags=re.MULTILINE | re.IGNORECASE)
-    text = re.sub(r'^>\s*\*"[^"\n]+"\*(?:\s*—\s*\*?(?:Journal Hint|Bestiary Entry)\*?)?\s*\n+', "", text, flags=re.MULTILINE)
+    text = re.sub(r'^>\s*\*"[^"\n]+"\*\s*—\s*\*?(?:Journal Hint|Bestiary Entry)\*?\s*\n+', "", text, flags=re.MULTILINE)
     text = re.sub(
         r"^\*{3}(?:[^\n*]+'s Ability|Recommended Enchantments)\*{3}\s*\n+",
         "",
@@ -2112,16 +2291,7 @@ def _compact_article_body(text: str, *, strip_skin_patches: bool = True) -> str:
             flags=re.MULTILINE | re.IGNORECASE,
         )
 
-    # 3. Strip redundant lead sentence right before the first `## ` heading if an Infobox is present
-    if "### Information" in text:
-        text = re.sub(
-            r"\n\n(?:The\s+)?\*\*[^*\n]+\*\*\s+is\s+(?:a|an)\s+[^\n]+\.\s*(?=\n\n##\s+)",
-            "",
-            text,
-            count=1,
-        )
-
-    # 4. Section-level processing (Overview pruning, Mastery compaction, Change History compaction)
+    # 3. Section-level processing (Overview pruning, Mastery compaction, Change History compaction)
     lines = text.splitlines()
     out_lines: list[str] = []
     i = 0

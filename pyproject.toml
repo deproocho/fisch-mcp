@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fisch-mcp"
+version = "2.0.0"
+description = "Local MCP server for the Official Fisch Wiki (fischipedia.org) with zero-credit MediaWiki API search, outlines, and DOM-to-Markdown cleaning."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+fisch-mcp = "server:serve_stdio"
+fischipedia-filter = "fischipedia_filter:main"
+
+[tool.setuptools]
+py-modules = ["server", "fischipedia_filter"]

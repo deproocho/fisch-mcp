@@ -34,7 +34,7 @@ Installing via `uv` or `pipx` places `fisch-mcp` and `fischipedia-filter` direct
 # Using uv
 uv tool install .
 # Or directly from GitHub without cloning:
-uv tool install git+https://github.com/<owner>/fisch-mcp
+uv tool install git+https://github.com/deproocho/fisch-mcp
 
 # Using pipx
 pipx install .

@@ -13,9 +13,12 @@ Exposes 4 tools over MCP stdio (JSON-RPC 2.0):
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import json
+import os
 import re
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -347,17 +350,38 @@ def _handle_list_category(args: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _get_tool_prefix() -> str:
+    return os.environ.get("FISCH_MCP_TOOL_PREFIX", "").strip()
+
+
+def _get_tools_schema(prefix: str = "") -> list[dict[str, Any]]:
+    p = prefix or _get_tool_prefix()
+    if not p:
+        return TOOLS_SCHEMA
+    return [
+        {**tool, "name": f"{p}{tool['name']}"}
+        for tool in TOOLS_SCHEMA
+    ]
+
+
 def dispatch_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Execute one MCP tool and return an MCP CallToolResult payload."""
     try:
         _ensure_latest_filter()
-        if name == "get_page":
+        prefix = _get_tool_prefix()
+        canonical_name = name
+        if prefix and canonical_name.startswith(prefix):
+            canonical_name = canonical_name[len(prefix) :]
+        elif canonical_name.startswith("fisch_"):
+            canonical_name = canonical_name[len("fisch_") :]
+
+        if canonical_name == "get_page":
             text = _handle_get_page(arguments)
-        elif name == "search_wiki":
+        elif canonical_name == "search_wiki":
             text = _handle_search_wiki(arguments)
-        elif name == "get_page_outline":
+        elif canonical_name == "get_page_outline":
             text = _handle_get_page_outline(arguments)
-        elif name == "list_category":
+        elif canonical_name == "list_category":
             text = _handle_list_category(arguments)
         else:
             return {
@@ -376,7 +400,23 @@ def dispatch_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def handle_rpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
+def _build_server_instructions(client_name: str = "") -> str:
+    base = (
+        "Official Fisch Wiki (fischipedia.org) local MCP server. "
+        "Prefer `search_wiki` or `list_category` when exact page titles are unknown, "
+        "`get_page_outline` to inspect sections on large pages, and `get_page` "
+        "(supports `Page#Fragment` such as `Fishing Rods#Stage_8`, `Enchanting#Empyrean`, "
+        "or `No-Life Rod#Skins`) to fetch cleaned Markdown."
+    )
+    if "opencode" in client_name.lower():
+        return (
+            f"{base} When invoking these tools inside Code Mode (`execute`), start the script "
+            "with a short `// Fischipedia: <tool> (<target/query>)` comment on line 1 for TUI visibility."
+        )
+    return base
+
+
+def handle_rpc_message(msg: dict[str, Any], *, tool_prefix: str = "") -> dict[str, Any] | None:
     """Process a single JSON-RPC 2.0 request/notification and return a response dict (or None)."""
     method = msg.get("method")
     msg_id = msg.get("id")
@@ -388,6 +428,8 @@ def handle_rpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
 
     if method == "initialize":
         client_Version = params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION
+        client_info = params.get("clientInfo") if isinstance(params, dict) else {}
+        client_name = str(client_info.get("name", "")) if isinstance(client_info, dict) else ""
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -400,14 +442,7 @@ def handle_rpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION,
                 },
-                "instructions": (
-                    "Official Fisch Wiki (fischipedia.org) local MCP server. "
-                    "Prefer `search_wiki` or `list_category` when exact page titles are unknown, "
-                    "`get_page_outline` to inspect sections on large pages, and `get_page` "
-                    "(supports `Page#Fragment` such as `Fishing Rods#Stage_8` or `Enchanting#Empyrean`) to fetch "
-                    "cleaned Markdown. When invoking these tools inside Code Mode (`execute`), start the script "
-                    "with a short `// Fischipedia: <tool> (<target/query>)` comment on line 1 for TUI visibility."
-                ),
+                "instructions": _build_server_instructions(client_name),
             },
         }
 
@@ -418,7 +453,7 @@ def handle_rpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {"tools": TOOLS_SCHEMA},
+            "result": {"tools": _get_tools_schema(tool_prefix)},
         }
 
     if method == "tools/call":
@@ -452,8 +487,152 @@ def handle_rpc_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def serve_stdio() -> int:
+def print_harness_config(harness: str) -> None:
+    """Print ready-to-use CLI registration commands and config snippets for MCP harnesses."""
+    server_script = str(Path(__file__).resolve())
+    installed_bin = shutil.which("fisch-mcp")
+    py_exe = "python" if sys.platform.startswith("win") else "python3"
+    cmd_str = "fisch-mcp" if installed_bin else f"{py_exe} -u {server_script}"
+    cmd_list = ["fisch-mcp"] if installed_bin else [py_exe, "-u", server_script]
+    stdio_cmd = "fisch-mcp" if installed_bin else py_exe
+    stdio_args = [] if installed_bin else ["-u", server_script]
+
+    sections: dict[str, str] = {
+        "opencode": (
+            "# OpenCode V2\n"
+            f"opencode mcp add fisch --global -- {cmd_str}\n\n"
+            "# Or in ~/.config/opencode/opencode.jsonc:\n"
+            + json.dumps(
+                {
+                    "$schema": "https://opencode.ai/config.json",
+                    "mcp": {
+                        "servers": {
+                            "fisch": {
+                                "type": "local",
+                                "command": cmd_list,
+                            }
+                        }
+                    },
+                },
+                indent=2,
+            )
+        ),
+        "claude": (
+            "# Claude Code\n"
+            f"claude mcp add --transport stdio --scope user fisch -- {cmd_str}\n\n"
+            "# Or in ~/.claude.json or .mcp.json:\n"
+            + json.dumps(
+                {
+                    "mcpServers": {
+                        "fisch": {
+                            "command": stdio_cmd,
+                            "args": stdio_args,
+                        }
+                    }
+                },
+                indent=2,
+            )
+        ),
+        "codex": (
+            "# OpenAI Codex (CLI, IDE & App)\n"
+            f"codex mcp add fisch -- {cmd_str}\n\n"
+            "# Or in ~/.codex/config.toml:\n"
+            f"[mcp_servers.fisch]\n"
+            f'command = "{stdio_cmd}"\n'
+            f"args = {json.dumps(stdio_args)}"
+        ),
+        "antigravity": (
+            "# Google Antigravity (Desktop & agy CLI)\n"
+            f"agy mcp add fisch {cmd_str}\n\n"
+            "# Or in ~/.gemini/config/mcp_config.json (or .agents/mcp_config.json):\n"
+            + json.dumps(
+                {
+                    "mcpServers": {
+                        "fisch": {
+                            "command": stdio_cmd,
+                            "args": stdio_args,
+                            "disabled": False,
+                        }
+                    }
+                },
+                indent=2,
+            )
+        ),
+        "cursor": (
+            "# Cursor IDE (~/.cursor/mcp.json or .cursor/mcp.json)\n"
+            + json.dumps(
+                {
+                    "mcpServers": {
+                        "fisch": {
+                            "command": stdio_cmd,
+                            "args": stdio_args,
+                        }
+                    }
+                },
+                indent=2,
+            )
+        ),
+        "cline": (
+            "# Cline (VS Code / JetBrains Extension & cline CLI)\n"
+            f"cline mcp add fisch --yes -- {cmd_str}\n\n"
+            "# Or in cline_mcp_settings.json:\n"
+            + json.dumps(
+                {
+                    "mcpServers": {
+                        "fisch": {
+                            "command": stdio_cmd,
+                            "args": stdio_args,
+                            "disabled": False,
+                            "autoApprove": [
+                                "get_page",
+                                "search_wiki",
+                                "get_page_outline",
+                                "list_category",
+                            ],
+                        }
+                    }
+                },
+                indent=2,
+            )
+        ),
+    }
+
+    target = harness.lower().strip()
+    if target == "all":
+        print("\n\n".join(sections.values()))
+    elif target in sections:
+        print(sections[target])
+    else:
+        raise ValueError(f"Unknown harness '{harness}'. Choose from: {', '.join([*sections.keys(), 'all'])}")
+
+
+def serve_stdio(argv: list[str] | None = None) -> int:
     """Run the MCP JSON-RPC 2.0 stdio loop with UTF-8 binary streams."""
+    parser = argparse.ArgumentParser(
+        description="Fisch Official Wiki (fischipedia.org) Local MCP Server over stdio."
+    )
+    parser.add_argument(
+        "--tool-prefix",
+        type=str,
+        default="",
+        help="Optional prefix to prepend to exposed tool names (e.g. 'fisch_'). Also reads FISCH_MCP_TOOL_PREFIX.",
+    )
+    parser.add_argument(
+        "--print-config",
+        type=str,
+        choices=["opencode", "claude", "codex", "antigravity", "cursor", "cline", "all"],
+        default=None,
+        help="Print MCP registration commands/config for the specified harness and exit.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.print_config:
+        print_harness_config(args.print_config)
+        return 0
+
+    if args.tool_prefix:
+        os.environ["FISCH_MCP_TOOL_PREFIX"] = args.tool_prefix.strip()
+
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
 
@@ -494,9 +673,19 @@ def serve_stdio() -> int:
             continue
 
         if isinstance(msg, dict):
-            resp = handle_rpc_message(msg)
+            resp = handle_rpc_message(msg, tool_prefix=args.tool_prefix)
             if resp is not None:
                 stdout.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+                stdout.flush()
+        elif isinstance(msg, list):
+            batch_resps = [
+                r
+                for item in msg
+                if isinstance(item, dict)
+                and (r := handle_rpc_message(item, tool_prefix=args.tool_prefix)) is not None
+            ]
+            if batch_resps:
+                stdout.write((json.dumps(batch_resps, ensure_ascii=False) + "\n").encode("utf-8"))
                 stdout.flush()
 
     return 0

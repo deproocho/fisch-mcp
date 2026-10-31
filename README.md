@@ -26,7 +26,29 @@ Compatible out of the box with **OpenCode V2**, **Claude Code**, **OpenAI Codex*
 
 Requires **Python 3.10+** (uses 100% Python standard library — no `pip` dependencies required).
 
-### Option A: Install `fisch-mcp` onto `PATH` (Recommended)
+### Quick Auto-Install (`install.sh` / `install.ps1`)
+
+The included installer scripts automatically install `fisch-mcp` (via `uv` or `pipx` if available, or direct Python fallback), detect all installed harnesses on your machine (**OpenCode V2**, **Claude Code**, **Codex**, **Antigravity**, **Cursor**, **Cline**), register the MCP server, and install `skills/fischipedia/SKILL.md`:
+
+```bash
+# Linux / macOS
+./install.sh
+
+# Preview actions without modifying files, or use a custom server name:
+./install.sh --dry-run
+./install.sh --name fisch-universal
+```
+
+```powershell
+# Windows PowerShell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+# Preview actions or customize server name:
+.\install.ps1 -DryRun
+.\install.ps1 -Name fisch-universal
+```
+
+### Option A: Install `fisch-mcp` onto `PATH` Manually
 
 Installing via `uv` or `pipx` places `fisch-mcp` and `fischipedia-filter` directly on your `PATH`, so harness configs don't need hardcoded file paths:
 
